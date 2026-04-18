@@ -1,14 +1,14 @@
 """
 Utility helpers used across the project.
 """
-
+from typing import Iterable
 # =========================
-# Printing / formatting
+# Printing
 # =========================
 
-def print_results(labels, values):
+def print_results(labels:Iterable, values:Iterable):
     """ Print labeled results in a structured format. """
-    assert len(labels) == len(values)
+    assert len(labels) == len(values), "labels and values must have the same length"
     idx = 0
     for i in range(len(labels)):
         if labels[i] == "results":
