@@ -1,5 +1,5 @@
 # Laboratori XNDL final notat - classificació d'imatges 32x32 en 14 categories
-
+#  best -> 86.4
 import os, time, copy
 import torch
 import torch.nn as nn
@@ -11,11 +11,13 @@ import numpy as np
 #  hiperparàmetres 
 DATA_DIR    = "../dades/dataset_npz/"
 BATCH_SIZE  = 512
-EPOCHS      = 24    
+EPOCHS      = 25    
 LR          = 0.1  
-TIME_LIMIT  = 15 * 60
-CUTOUT_SIZE = 4
+TIME_LIMIT  = 18 * 60
+CUTOUT_SIZE = 5
 CUTOUT_PROB = 0.5
+
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}\n")
@@ -37,8 +39,7 @@ class NpzDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.images[idx], self.labels[idx]
 
-
-def cutout(imgs, size=CUTOUT_SIZE, p=CUTOUT_PROB, n_holes=2):
+def cutout(imgs, size=CUTOUT_SIZE, p=CUTOUT_PROB, n_holes=1):
     for _ in range(n_holes):
         B, _, H, W = imgs.shape
         dev = imgs.device
@@ -108,9 +109,9 @@ class ResNet9(nn.Module):
     def __init__(self, in_channels, num_classes):
         super().__init__()
         self.conv1 = ConvBlock(in_channels, 64)
-        self.conv1b = ConvBlock(64, 64)          # NEW — still 32×32
+        self.conv1b = ConvBlock(64, 64) 
         self.conv2 = ConvBlock(64, 128, pool=True)
-        self.res1 = nn.Sequential(ConvBlock(128, 128), ConvBlock(128, 128), nn.Dropout(0.1))
+        self.res1 = nn.Sequential(ConvBlock(128, 128), ConvBlock(128, 128))
         self.conv3 = ConvBlock(128, 256, pool=True)
         self.conv4 = ConvBlock(256, 512, pool=False)
         self.res2 = nn.Sequential(ConvBlock(512, 512), ConvBlock(512, 512))
@@ -122,8 +123,10 @@ class ResNet9(nn.Module):
         self.gmp = nn.AdaptiveMaxPool2d(1)
         self.dropout = nn.Dropout(0.4)
         self.fc = nn.Linear(1024, num_classes)   # 512 (avg) + 512 (max)
+
+        self.use_tta = True
         
-    def forward(self, x):
+    def _forward_features(self, x):
         out = self.conv1(x)
         out = self.conv1b(out)
         out = self.conv2(out)
@@ -131,21 +134,24 @@ class ResNet9(nn.Module):
         out = self.conv3(out)
         out = self.conv4(out)
         out = self.res2(out) + out
- 
         avg_pooled = self.gap(out).flatten(1)
         max_pooled = self.gmp(out).flatten(1)
         pooled = torch.cat([avg_pooled, max_pooled], dim=1)
- 
-        out = self.dropout(pooled)
-        out = self.fc(out)
-        return out
+        return self.fc(self.dropout(pooled))
+
+    def forward(self, x):
+        logits = self._forward_features(x)
+        if self.training or not self.use_tta:
+            return logits                      # single pass, full training speed
+        logits_flipped = self._forward_features(torch.flip(x, dims=[3]))
+        return (logits + logits_flipped) / 2   # TTA only at inference
 
 model = ResNet9(in_channels=1, num_classes=n_classes).to(device)
 n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Paràmetres entrenables: {n_params:,}\n")
 
 #  hem afegit label_smoothing per ajudar amb l'overfitting
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1) 
+criterion = nn.CrossEntropyLoss() 
 
 #  mentre que Adam i AdamW convergien més rapidament, després de diverses proves hem trobat que SGD amb Nesterov's momentum
 #  donava millors resultats de generalització
@@ -187,19 +193,23 @@ for epoch in range(1, EPOCHS + 1):
     if time.time() - t_start > TIME_LIMIT:
         print(f"Temps exhaurit abans de l'epoch {epoch}. Aturant.")
         break
+
     print("OPTIMIZER param groups:", optimizer.param_groups[0]['lr'] )
     model.train()
     correct, total, loss_sum = 0, 0, 0.0
 
     perm = torch.randperm(len(train_labels), device=device)
     for i in range(0, len(perm), BATCH_SIZE):
+        if time.time() - t_start > TIME_LIMIT:
+            print(f"Temps exhaurit abans de l'epoch {epoch}. Aturant.")
+            break
         idx = perm[i:i+BATCH_SIZE]
         imgs, labels = train_images[idx], train_labels[idx]
         
         #  la data augmentation la fem aqui fent servir la gpu, per evitar el que mencionavem abans: el coll d'ampolla de la cpu.
         #  no sabem si aquesta es la millor solució, però ens ha funcionat per millorar el problema del temps significativament
         imgs = tf_train(imgs)
-        
+
         optimizer.zero_grad()
         
         #  forward pass
@@ -229,7 +239,10 @@ for epoch in range(1, EPOCHS + 1):
         
     train_acc  = correct / total
     train_loss = loss_sum / total
+
+    model.use_tta = False
     val_acc, val_loss = evaluate(val_loader)
+    model.use_tta = True
 
     print(f"{epoch:>5}  {train_loss:>10.4f}  {train_acc:>8.2%}  "
           f"{val_loss:>8.4f}  {val_acc:>6.2%}")
@@ -246,6 +259,7 @@ print(f"Temps total: {time.time()-t_start:.0f}s")
 
 
 model.load_state_dict(best_model_wts)
+torch.save(model.state_dict(), 'best_model.pt')
 
 from sklearn.metrics import confusion_matrix
 import numpy as np
@@ -256,8 +270,14 @@ with torch.no_grad():
     for imgs, labels in val_loader:
         imgs = tf_val(imgs.to(device))
         out = model(imgs)
+
+        correct  += (out.argmax(1) == labels).sum().item()
+        total    += len(labels)
+
         all_preds.append(out.argmax(1).cpu())
         all_labels.append(labels)
+
+print("\nFINAL ACCURACY:", correct/total)
 cm = confusion_matrix(torch.cat(all_labels), torch.cat(all_preds))
 
 import seaborn as sns
@@ -268,4 +288,4 @@ sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
             xticklabels=classes, yticklabels=classes)
 plt.xlabel("Predicted")
 plt.ylabel("True")
-plt.savefig('cm5.png')
+plt.savefig('cm7.png')
