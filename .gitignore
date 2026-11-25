@@ -1,1 +1,7 @@
 PRUEBAS/
+*.npz
+*.pt
+*.pth
+dades/
+checkpoint/
+PRUEBAS/
